@@ -1,7 +1,7 @@
 __pycache__
 logs/
-quiling/
-.quilingenv/
+qiling/
+.qilingenv/
 tenda-nettapd/
 ghidra/
 firmware/

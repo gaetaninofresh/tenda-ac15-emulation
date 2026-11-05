@@ -1,0 +1,180 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[italian]{babel}
+\usepackage{fancyhdr}
+
+
+\renewcommand{\labelitemi}{-}
+\sloppy
+\emergencystretch=3em
+
+\title{\textbf{Emulazione del daemon \texttt{httpd} (Tenda AC15) tramite Qiling}}
+\date{}
+
+\pagestyle{fancy}
+\fancyhf{} % clear all header and footer fields
+\setcounter{secnumdepth}{0}
+\fancyhead[R]{Gaetano La Rocca, T20089}
+
+\begin{document}
+
+\maketitle
+
+\tableofcontents
+\vspace{1cm}
+\hrule
+\vspace{0.5cm}
+
+\newpage
+
+\section{Introduzione e Architettura del Sistema di Emulazione}
+L'obiettivo di questo progetto è costruire (o quantomeno gettare le basi) per un ambiente di emulazione per il firmware del router Tenda AC15 AC1900 (versione 15.03.05.19), affetto da un'ampissimo range di vulnerabilità (ad oggi più di 85 CVE), al fine di eseguire live analysis di esse attraverso \texttt{gdb}.
+
+L'emulazione diretta    
+
+L'environment di emulazione è articolato nei seguenti script Python:
+\begin{itemize}
+    \item \textbf{\texttt{emu\_gdb.py}}: Script principale contenente l'inizializzazione del sandbox Qiling, il thread di ascolto per il socket NVRAM (\texttt{nvram\_listener}), gli hook sulle system call POSIX e l'aggancio ai trigger di \texttt{GdbManager}.
+    \item \textbf{\texttt{gdb\_debugging\_ext.py}}: Modulo che implementa la classe \texttt{GdbManager} per il debugging basato su eventi, la trappola sui memory fault, il trace sui basic block, la generazione automatica degli script \texttt{attach\_<pid>.gdb} con risoluzione dell'offset \texttt{.text} delle librerie ELF e i comandi \texttt{monitor} via pacchetti \texttt{qRcmd}.
+    \item \textbf{\texttt{ipc\_shim.py}}: Modulo che sostituisce l'implementazione interna delle code di messaggi System V di Qiling con chiamate dirette al kernel dell'host Linux tramite \texttt{ctypes}.
+    \item \textbf{\texttt{emu\_logging.py}}: Infrastruttura di logging duale (\texttt{complete\_log} e \texttt{small\_log}) con granularità differenti e tracciamento del PID host reale.
+\end{itemize}
+
+\section{Analisi dei Problemi Riscontrati, Origini e Soluzioni}
+
+Di seguito vengono esaminati i principali problemi riscontrati utilizzando Qiling out-of-the-box, classificati per area funzionale.
+
+\subsection{Anomalie e Crash Interni del Motore Qiling}
+
+\subsubsection{Crash di Asserzione su Syscall con Lunghezza Zero (\texttt{is\_mapped})}
+\begin{itemize}
+    \item \textbf{Problema riscontrato:} Nelle prime fasi di avvio, l'emulatore terminava improvvisamente all'interno di \texttt{ql\_syscall\_write} sollevando un'eccezione \texttt{AssertionError: expected a positive size value}.
+    \item \textbf{Origine del problema:} Il binario emulato invoca legittimamente la system call POSIX \texttt{write(fd, buf, 0)}. Prima di eseguire l'operazione, Qiling verifica che il buffer sia mappato in memoria attraverso \texttt{ql.mem.is\_mapped(buf, count)}, il quale contiene un'asserzione interna che impone \texttt{size > 0}.
+    \item \textbf{Soluzione implementata:} Inizialmente è stata adottata una soluzione parziale consistente in un hook per la sola syscall \texttt{write} che riceveva silenziosamente l'eccezione, successivamente è stata adottata una soluzione più generale ed efficace patchando direttamente il metodo \texttt{ql.mem.is\_mapped}. La funzione wrapper \texttt{safe\_is\_mapped(addr, size, ...)} verifica se \texttt{size <= 0} e, in tal caso, restituisce immediatamente \texttt{True}, aggirando l'asserzione per qualsiasi syscall che operi su buffer di lunghezza nulla.
+\end{itemize}
+
+\subsubsection{Crash del Thread Manager non Inizializzato (\texttt{cur\_thread} = \texttt{None}) e Gestione di \texttt{clone}}
+\begin{itemize}
+    \item \textbf{Problema riscontrato:} L'esecuzione della system call \texttt{clone} e l'accesso agli hook usati per leggere il traffico di rete causavano il crash dell'emulatore con errore \texttt{AttributeError: 'NoneType' object has no attribute 'cur\_thread'} (o \texttt{'id'}).
+    \item \textbf{Origine del problema:} Su architettura ARM o in determinate fasi di inizializzazione single-threaded, il sottosistema \texttt{ql.os.thread\_management} di Qiling mantiene l'attributo \texttt{cur\_thread} impostato a \texttt{None}. Quando \texttt{ql\_syscall\_clone} tenta di leggere l'ID del thread corrente per duplicarne lo stato, l'accesso all'attributo fallisce.
+    \item \textbf{Soluzione implementata (Discrepanza README vs Codice):} Inizialmente è stato tentato il reindirizzamento forzato di \texttt{clone} verso \texttt{ql\_syscall\_vfork}. Tuttavia, poiché in Linux \texttt{clone} gestisce sia la creazione di processi che di thread (\texttt{pthread\_create} con flag \texttt{CLONE\_VM}), l'uso forzato \texttt{vfork} rompeva il multithreading nativo, bloccando il processo padre. Nel codice definitivo è stata invece implementata la funzione \textbf{\texttt{high\_fidelity\_clone}}:
+    \begin{enumerate}
+        \item Controlla se \texttt{tm.cur\_thread} è \texttt{None}.
+        \item In caso affermativo, istanzia un oggetto mock temporaneo \texttt{TempThread} il cui attributo \texttt{id} corrisponde con il PID del processo (\texttt{getattr(ql.os, 'pid', 1000)}).
+        \item Invoca \texttt{sched.ql\_syscall\_clone(ql, *args)}, preservando il parsing dei flag e il mapping TLS (Thread Local Storage).
+        \item Nel blocco \texttt{finally}, ripristina \texttt{tm.cur\_thread = None} per non corrompere lo scheduler durante il context switching.
+    \end{enumerate}
+    Parallelamente, per gli hook di rete e \texttt{stat} è stata scritta la funzione helper \texttt{\_get\_tid(ql)}, che cattura \texttt{AttributeError} e ripiega su \texttt{getattr(ql.os, 'pid', 0)}.
+\end{itemize}
+
+\subsubsection{Crash sulla Chiusura delle socket (\texttt{shutdown} con \texttt{Errno 107: ENOTCONN})}
+\begin{itemize}
+    \item \textbf{Problema riscontrato:} Al termine di una transazione HTTP o alla caduta di una connessione, Qiling crashava dentro \texttt{ql\_syscall\_shutdown} sollevando \texttt{OSError: [Errno 107] Transport endpoint is not connected}.
+    \item \textbf{Origine del problema:} Il binario \texttt{httpd} invoca \texttt{shutdown()} su un file descriptor di una socket che è già stata disconnessa dal peer. Il kernel Linux host restituisce l'errore \texttt{ENOTCONN} (107), che Python traduce in un'eccezione \texttt{OSError} non catturata dall'implementazione standard di Qiling.
+    \item \textbf{Soluzione implementata:} La syscall \texttt{shutdown} è stata sostituita con \texttt{my\_shutdown(ql, sockfd, how)}. La funzione recupera l'oggetto socket tramite \texttt{get\_opened\_socket(ql.os, sockfd)}, esegue \texttt{sock.shutdown(how)} all'interno di un blocco \texttt{try-except OSError}, registra un warning sul logger dedicato (\texttt{log\_sock}) e restituisce al binario guest il codice di errore negativo conforme allo standard Linux (\texttt{-error\_number}, ovvero \texttt{-107}).
+\end{itemize}
+
+\subsection{Comunicazione Inter-Processo (IPC) e Blocchi Apparenti (Hang)}
+
+\subsubsection{Loop Infinito di Polling sulle Code di Messaggi System V (\texttt{ftok} e \texttt{msgget})}
+\begin{itemize}
+    \item \textbf{Problema riscontrato:} Il processo \texttt{httpd} e i processi figli generati (\texttt{sh}, \texttt{cfm}) sembravano bloccarsi indefinitamente in chiamate \texttt{wait4}, \texttt{select} o \texttt{nanosleep}, terminando dopo circa 30 secondi con i messaggi \texttt{PostMsg msg create error} e \texttt{Post Msg failed}.
+    \item \textbf{Origine del problema:} La funzione \texttt{PostMsg()} del firmware (e il comando \texttt{cfm post <modulo>}) calcola la chiave IPC tramite \texttt{key = ftok(\textquotedbl/var/<modulo>\textquotedbl, 0)} (es. \texttt{/var/netctrl}, \texttt{/var/time\_check}) e successivamente chiama \texttt{msgget(key, IPC\_EXCL | 0666)} \textbf{senza} specificare il flag \texttt{IPC\_CREAT}, in quanto questa viene creata da un altro daemon nel firmware originale. Il blocco aveva una doppia origine:
+    \begin{enumerate}
+        \item \textit{Assenza del file target per \texttt{ftok}:} La funzione di libreria \texttt{ftok()} esegue una \texttt{stat()} sul percorso per ricavare l'inode. Non esistendo il file in \texttt{/var/}, \texttt{stat()} falliva, \texttt{ftok()} restituiva \texttt{-1} (\texttt{0xffffffff}) e \texttt{msgget} falliva.
+        \item \textit{Inadeguatezza delle code interne di Qiling:} Anche con una chiave valida, nessun demone esterno era in esecuzione per creare la coda. Inoltre, le code native di Qiling risiedono in un dizionario Python (\texttt{ql.os.msq}): poiché Qiling emula \texttt{fork()} invocando la vera \texttt{os.fork()} del sistema operativo host, ogni processo figlio eredita una copia privata e isolata del dizionario, rendendo impossibile la comunicazione tra processi distinti. Infine, la \texttt{msgrcv()} nativa di Qiling esegue un busy-spin in Python.
+    \end{enumerate}
+    \item \textbf{Soluzione implementata (\texttt{ipc\_shim.py}):}
+    \begin{enumerate}
+        \item \textit{Tracciamento \texttt{stat}+\texttt{msgget}:} In \texttt{emu\_gdb.py} sono stati inseriti hook di ingresso e uscita su \texttt{stat}, \texttt{stat64}, \texttt{lstat} e \texttt{lstat64} per correlare i fallimenti di \texttt{stat} con le chiamate \texttt{msgget(key=0xffffffff)}.
+        \item \textit{Delega al Kernel Host (\texttt{IpcShim}):} Le syscall \texttt{msgget}, \texttt{msgsnd} e \texttt{msgrcv} sono state rimpiazzate nel modulo \texttt{ipc\_shim.py} (attivo di default a meno che \texttt{EMU\_IPC=off}) con wrapper che invocano direttamente le funzioni della \texttt{libc} dell'host Linux tramite \texttt{ctypes}. Le code del kernel host sono nativamente condivise tra tutti i processi generati da \texttt{os.fork()}.
+        \item \textit{Creazione On-Demand (\texttt{force\_create=True}):} Quando il binario chiama \texttt{msgget} senza \texttt{IPC\_CREAT}, lo shim tenta comunque di creare la coda passando \texttt{IPC\_CREAT | IPC\_EXCL | mode}, sbloccando immediatamente il mittente.
+        \item \textit{Prevenzione dello stallo in scrittura (\texttt{drop\_oldest\_when\_full=True}):} Poiché i demoni riceventi non sono attivi, le code si riempirebbero bloccando i mittenti. Lo shim forza \texttt{IPC\_NOWAIT} fino a 64 tentativi: se \texttt{msgsnd} fallisce con \texttt{EAGAIN}, rimuove automaticamente il messaggio più vecchio tramite una \texttt{msgrcv(..., 8192, 0, IPC\_NOWAIT | MSG\_NOERROR)} e ritenta l'invio.
+        \item \textit{Polling non bloccante in lettura (\texttt{msgrcv}):} Per evitare di congelare l'intero emulatore in un'attesa kernel non interrompibile da \texttt{Ctrl-C}, \texttt{IpcShim.msgrcv} interroga sempre il kernel host con \texttt{IPC\_NOWAIT} e, in caso di \texttt{ENOMSG} su chiamata bloccante, attende in Python con \texttt{time.sleep(0.01)} fino all'eventuale scadenza di \texttt{rcv\_timeout}.
+        \item \textit{Traduzione dell'ABI (32-bit vs 64-bit):} La struttura \texttt{struct msgbuf \{ long mtype; char mtext[]; \}} utilizza un \texttt{long} di 4 byte sul guest ARM32, ma di 8 byte sull'host x86-64. Lo shim converte dinamicamente il campo \texttt{mtype} e l'offset del payload ad ogni invio e ricezione.
+        \item \textit{Pulizia automatica:} Ogni coda creata sull'host viene annotata nel file \texttt{logs/ipc\_queues.txt} nel formato \texttt{msqid key creator\_pid} e rimossa all'uscita dal solo processo padre (\texttt{os.getpid() == self.\_owner\_pid}) tramite un handler \texttt{atexit} (utilizzando \texttt{msgctl(msqid, IPC\_RMID, None)}), oltre a ripulire all'avvio eventuali code orfane di esecuzioni precedenti.
+    \end{enumerate}
+\end{itemize}
+
+\subsection{File System Virtuale, Linker Dinamico e Configurazione di Rete}
+
+\subsubsection{Mancanza di File e Directory Volatili e Rimozione di \texttt{core\_pattern}}
+\begin{itemize}
+    \item \textbf{Problema riscontrato:} Errori \texttt{ENOENT} (File o directory non esistente) durante l'apertura di file di stato o di configurazione temporanei in \texttt{/var}, \texttt{/tmp}, \texttt{/etc}, \texttt{/dev}, \texttt{/proc} e \texttt{/sys}.
+    \item \textbf{Origine del problema:} L'estrazione statica del file system SquashFS non contiene le directory e i file generati dinamicamente in RAM (\texttt{tmpfs}) durante la sequenza di boot reale del router.
+    \item \textbf{Soluzione implementata:} La problematica viene risolta in due momenti separati:
+    \begin{enumerate}
+        \item All'avvio di \texttt{my\_sandbox}, vengono create direttamente dentro \texttt{ROOTFS} le directory essenziali (\texttt{dev}, \texttt{proc}, \texttt{sys}, \texttt{tmp}, \texttt{var/run}), viene mappato \texttt{/dev/urandom} sull'equivalente host e viene rimosso l'eventuale file \texttt{\{ROOTFS\}/proc/sys/kernel/core\_pattern}.
+        \item La funzione \texttt{auto\_create\_virtual\_file(path)} opera direttamente su \texttt{ROOTFS} (escludendo i file \texttt{.so} o contenenti \texttt{.so.} per non interferire con la ricerca dei percorsi del dynamic linker) ed è invocata \textbf{esclusivamente} dagli hook di ingresso di \texttt{open} (\texttt{hook\_open\_enter}) e \texttt{openat} (\texttt{hook\_openat\_enter}, limitatamente ai path assoluti che iniziano con \texttt{'/'}), e \textbf{non} durante le chiamate \texttt{stat}. Inoltre, la funzione helper \texttt{\_o\_creat(ql)} distingue dinamicamente il flag \texttt{O\_CREAT} tra architettura MIPS (\texttt{0x100}) e ARM/x86 (\texttt{0x40}, dove \texttt{0x100} è invece \texttt{O\_NOCTTY}) per evitare falsi positivi nei log di creazione file.
+    \end{enumerate}
+\end{itemize}
+
+\subsection{Sottosistema di Tracciamento, Hook e Logging Multi-Processo}
+\subsubsection{Architettura di Logging Multi-Processo e Cattura di \texttt{stdout}/\texttt{stderr} (\texttt{emu\_logging.py})}
+\begin{itemize}
+    \item \textbf{Problema riscontrato:}
+    \begin{enumerate}
+        \item Impossibilità di distinguere i processi nei log: \texttt{ql.os.pid} restituiva sempre lo stesso valore statico emulato (es. \texttt{1996}) per tutti i processi figli generati da \texttt{fork()}, e il campo \texttt{\%(process)d} del modulo \texttt{logging} di Python produceva \texttt{None} causando errori di formattazione.
+        \item I messaggi stampati dal binario guest su \texttt{stdout} e \texttt{stderr} venivano inviati direttamente al terminale host, aggirando completamente il logger di Qiling.
+        \item Gli errori interni agli hook venivano silenziati da blocchi \texttt{except: pass}.
+    \end{enumerate}
+    \item \textbf{Origine del problema:} Qiling imposta globalmente \texttt{logging.logProcesses = False} e crea per ogni istanza un logger denominato \texttt{qiling<id>} con \texttt{propagate = False}.
+    \item \textbf{Soluzione implementata:}
+    \begin{enumerate}
+        \item Nel modulo \texttt{emu\_logging.py} è stato definito il formatter \texttt{\_PidFormatter}, che inietta dinamicamente il vero PID del sistema operativo host (\texttt{os.getpid()}) nell'attributo \texttt{record.hostpid} di ogni record di log al momento della formattazione, garantendo il tracciamento esatto anche dopo una \texttt{os.fork()}. L'hook \texttt{hook\_execve} legge fino a 16 argomenti da \texttt{argv[]} (rispettando \texttt{ql.arch.pointersize}) e registra sia \texttt{emu\_pid} sia \texttt{host\_pid} e \texttt{host\_ppid}.
+        \item Il metodo \texttt{logs.attach\_qiling(ql)} collega direttamente il file handler di \texttt{complete\_log} (livello \texttt{DEBUG}, configurabile in verbosità tramite \texttt{EMU\_QL\_VERBOSE=off|default|debug|disasm}) all'istanza \texttt{ql.log}, interlacciando in ordine cronologico reale le tracce interne di Qiling con gli eventi degli hook \texttt{emu.hook.<nome>} (che al livello \texttt{INFO} confluiscono invece anche in \texttt{small\_log} e su console).
+        \item È stato aggiunto \texttt{hook\_write\_enter} sui file descriptor \texttt{1} (\texttt{stdout}) e \texttt{2} (\texttt{stderr}) (per scritture fino a 4096 byte) per catturare l'output testuale del binario guest e convogliarlo nel logger \texttt{guest\_stdio}.
+        \item Negli hook di uscita (\texttt{hook\_net\_exit}, \texttt{\_stat\_exit}, \texttt{\_msgget\_exit}), il valore di ritorno della syscall viene estratto da \texttt{args[-1]} e normalizzato con segno su \texttt{ql.arch.bits} tramite la funzione helper \texttt{\_signed(ql, value)}.
+        \item I blocchi \texttt{except} silenziosi negli hook principali sono stati sostituiti dalla funzione \texttt{\_hook\_failed(name)}, che registra l'intero traceback a livello \texttt{DEBUG} all'interno di \texttt{complete\_log}.
+    \end{enumerate}
+\end{itemize}
+
+\subsection{Sottosistema per il Debugging (\texttt{gdb\_debugging\_ext.py} / \texttt{emu\_gdb.py})}
+
+\subsubsection{Colli di Bottiglia del Server GDB Nativo di Qiling  e generale mancanza di feature QoL(\texttt{ql.debugger = "gdb"})}
+\begin{itemize}
+    \item \textbf{Problema riscontrato:} Il server GDB predefinito di Qiling ha tre gravi limitazioni nell'emulazione di binari embedded multi-processo come \texttt{httpd}:
+    \begin{enumerate}
+        \item \textit{Lentezza in fase di inizializzazione:} L'esecuzione del dynamic linking, del polling sul socket NVRAM e del setup IPC SysV sotto lo stub GDB in Python risulta lenta al limite dell'inutilizzabile.
+        \item \textit{Assenza dei simboli delle librerie condivise:} Il server GDB di Qiling non implementa il protocollo di rendezvous del dynamic linker SVR4 (\texttt{r\_debug}), lasciando \texttt{libc.so}, \texttt{libcfm.so} e le altre librerie condivise come indirizzi non mappati in GDB.
+        \item \textit{Collisioni di porta su \texttt{fork()}:} Poiché Qiling emula \texttt{fork()}/\texttt{vfork()} tramite chiamate reali a \texttt{os.fork()} sull'host, qualsiasi processo figlio eredita la porta TCP associata a GDB (\texttt{9999}), causando conflitti di socket o blocchi.
+    \end{enumerate}
+    \item \textbf{Origine del problema:} Lo stub \texttt{QlGdb} nativo è progettato per sessioni single-process statiche fin dall'entry point e non gestisce né la rilocazione automatica delle sezioni \texttt{.text} delle shared library caricate da \texttt{ql.loader}, né il multiplexing delle porte TCP dopo una \texttt{os.fork()}.
+    \item \textbf{Soluzione implementata (\texttt{GdbManager} in \texttt{gdb\_debugging\_ext.py}):} Il modulo esegue l'emulatore alla massima velocità di Unicorn e avvia dinamicamente un server \texttt{QlGdb} fork-safe e consapevole dei simboli \textbf{esclusivamente al verificarsi di un evento target o di un memory fault}, controllato tramite variabili d'ambiente (attivo di default con \texttt{EMU\_GDB=on} in \texttt{httpd\_emulation\_harness.py}):
+    \begin{enumerate}
+        \item \textit{Attivazione On-Demand basata su Eventi (Event-Triggered Spawner):} Invece di collegare GDB al boot, \texttt{httpd} si inizializza normalmente e la sessione GDB viene aperta da \texttt{GdbManager.spawn()} (prevenendo sessioni duplicate sulla stessa porta tramite il set \texttt{\_active\_sessions}) solo quando scatta uno dei seguenti trigger configurabili via environment:
+        \begin{itemize}
+            \item \texttt{EMU\_GDB\_AT\_ENTRY=1}: Registra un \texttt{ql.hook\_address} su \texttt{ql.loader.elf\_entry} per mettere in pausa l'esecuzione all'entry point ELF prima di \texttt{main()}.
+            \item \texttt{EMU\_GDB\_ON\_URI}: Invocato da \texttt{hook\_net\_exit} (\texttt{check\_http\_trigger}), mette in pausa l'emulazione all'uscita di \texttt{recv}/\texttt{recvfrom}/\texttt{read} non appena viene intercettata una richiesta HTTP contenente la sottostringa specificata (es. \texttt{/goform/GetRouterStatus}).
+            \item \texttt{EMU\_GDB\_ON\_EXEC}: Invocato da \texttt{hook\_execve} (\texttt{check\_exec\_trigger}), mette in pausa l'esecuzione quando il percorso del binario o la stringa degli argomenti contengono la sottostringa indicata.
+            \item \texttt{EMU\_GDB\_ON\_IPC}: Invocato da \texttt{\_msgsnd\_enter} (\texttt{check\_ipc\_trigger}), legge dalla memoria del guest il campo \texttt{mtype} e il payload del messaggio e mette in pausa l'emulazione se la stringa configurata compare nel payload o corrisponde a \texttt{str(mtype)}. In \texttt{httpd\_emulation\_harness.py}, \texttt{\_msgsnd\_enter} viene registrato con \texttt{QL\_INTERCEPT.ENTER} anche quando \texttt{IpcShim} è attivo, così da preservare il trigger GDB senza interferire con la sostituzione della syscall.
+        \end{itemize}
+        \item \textit{Generazione Automatica dello Script di Caricamento Simboli (\texttt{logs/attach\_<pid>.gdb}):} Ad ogni invocazione di \texttt{spawn()}, il metodo \texttt{generate\_gdb\_script()} ispeziona \texttt{ql.loader.images} e, per ogni file contenente \texttt{.so} nel nome, calcola l'offset virtuale (\texttt{sh\_addr}) della sezione \texttt{.text} tramite la funzione \texttt{\_get\_elf\_text\_offset(elf\_path)} (che utilizza \texttt{pyelftools} se disponibile, oppure un parser binario di fallback basato su \texttt{struct.unpack\_from} per header ELF a 32-bit little/big-endian). Genera quindi il file \texttt{logs/attach\_<pid>.gdb}, che imposta l'architettura ARM, configura \texttt{solib-absolute-prefix} su \texttt{ROOTFS}, carica il binario principale con \texttt{file}, mappa ogni libreria condivisa all'indirizzo \texttt{img.base + text\_off} tramite \texttt{add-symbol-file} ed esegue \texttt{target remote 127.0.0.1:<port>}, \texttt{info registers} e \texttt{x/5i \$pc}.
+        \item \textit{Trappola di Crash Just-In-Time (\texttt{EMU\_GDB\_ON\_CRASH=1}) e Trace dump (\texttt{EMU\_GDB\_TRACE=1}):} Un hook sui basic block (\texttt{ql.hook\_block(self.\_hook\_block)}) mantiene una \texttt{deque} circolare (\texttt{trace\_ring}, di profondità predefinita \texttt{EMU\_GDB\_TRACE\_DEPTH=128}) contenente le tuple \texttt{(address, lr, sp)} lette da \texttt{ql.arch.regs.lr} e \texttt{ql.arch.regs.arch\_sp}. Quando Unicorn rileva un accesso invalido o protetto alla memoria (\texttt{UC\_MEM\_READ\_UNMAPPED}, \texttt{UC\_MEM\_WRITE\_UNMAPPED}, \texttt{UC\_MEM\_FETCH\_UNMAPPED}, \texttt{UC\_MEM\_WRITE\_PROT}, \texttt{UC\_MEM\_READ\_PROT}, \texttt{UC\_MEM\_FETCH\_PROT}, codici 16--21) intercettato da \texttt{ql.hook\_mem\_invalid(self.\_hook\_mem\_invalid)}, \texttt{GdbManager} registra a livello \texttt{ERROR} l'indirizzo, il tipo di accesso e il valore coinvolto, invoca \texttt{dump\_trace(ql)} per riversare nel logger \texttt{emu.hook.gdb} (\texttt{small\_log} e \texttt{complete\_log}) la trace con risoluzione simbolica \texttt{<immagine>+<offset>} e avvia il server GDB sull'istruzione che ha causato il fault prima di restituire \texttt{False}.
+        \item \textit{Routing delle Porte Multi-Processo Fork-Aware:} Il metodo \texttt{GdbManager.\_get\_port()} confronta \texttt{os.getpid()} con il PID iniziale salvato all'avvio (\texttt{self.\_initial\_pid}): il processo padre \texttt{httpd} utilizza la porta base \texttt{EMU\_GDB\_PORT} (default \texttt{9999}), mentre qualsiasi processo figlio generato da \texttt{fork()} utilizza la porta deterministica \texttt{10000 + (os.getpid() \% 5000)} e genera uno script \texttt{logs/attach\_<child\_pid>.gdb} isolato.
+        \item \textit{Comandi GDB \texttt{monitor} Personalizzati:} Sostituendo il metodo \texttt{gdb.handle\_qRcmd} sull'istanza \texttt{QlGdb}, il gestore decodifica il payload esadecimale dei comandi \texttt{monitor} inviati da \texttt{gdb-multiarch} ed esegue \texttt{\_handle\_monitor(ql, cmd\_str)}:
+        \begin{itemize}
+            \item \texttt{monitor help}: Elenca i comandi \texttt{monitor} disponibili.
+            \item \texttt{monitor vmmap}: Restituisce la mappa di memoria formattata di Qiling (\texttt{ql.mem.get\_formatted\_mapinfo()}).
+            \item \texttt{monitor trace [N]}: Mostra gli ultimi \texttt{N} (default 32) basic block registrati in \texttt{trace\_ring}, risolvendo \texttt{PC} e \texttt{LR} nel formato \texttt{<immagine>+<offset>} tramite \texttt{\_resolve\_image\_symbol} insieme a \texttt{SP}.
+            \item \texttt{monitor where <addr>}: Risolve un indirizzo esadecimale o intero nell'immagine ELF corrispondente (\texttt{<name>+<offset>} oppure \texttt{unmapped}).
+            \item \texttt{monitor ipc}: Legge il file di registro \texttt{logs/ipc\_queues.txt} gestito da \texttt{IpcShim} per elencare le code SysV attive sull'host (\texttt{msqid key creator\_pid}).
+            \item \texttt{monitor nvram list} / \texttt{monitor nvram set <key> <val>}: Elenca o aggiorna a caldo le coppie chiave/valore nel dizionario condiviso \texttt{NVRAM\_STORE} utilizzato da \texttt{nvram\_listener}.
+            \item \texttt{monitor snapshot save [name]} / \texttt{restore [name]} / \texttt{list}: Salva in memoria (\texttt{ql.save(reg=True, mem=True, cpu\_context=True)}), ripristina (\texttt{ql.restore(...)}) o elenca gli snapshot dello stato CPU e RAM sotto la chiave \texttt{[name]} (default \texttt{default}).
+        \end{itemize}
+    \end{enumerate}
+\end{itemize}
+
+\section{Limitazioni Attuali}
+\subsubsection{Assenza dei deamon riceventi e Semantica IPC Incompleta} 
+    \texttt{ipc\_shim.py} permette a \texttt{httpd} e \texttt{cfm} di depositare con successo i messaggi nelle code del kernel host, evitando il blocco del mittente. Tuttavia, poiché i demoni di backend del firmware (es. \texttt{netctrl}, \texttt{time\_check}) non sono in esecuzione, nessun processo consuma tali messaggi o applica le modifiche di configurazione richieste.
+
+    Al momento non sono state esplorate concretamente soluzioni ma, considerati gli obiettivi del progetto, sarebbe probabilmente sufficiente un modulo atto a consumare i segnali IPC strettamente necessari all'emulazione della funzionalità che si sta analizzando. Alternativamente ci sarebbe la possibilità di emulare separatamente il daemon attraverso il modulo attuale in quanto l'IPC è gestito attraverso le queque SystemV della macchina host. Ciò richiederebbe però un considerevole effort nel generalizzare le funzionaità presenti e la probabile implementazione di soluzioni custom (come già fatto per \texttt{httpd}) per problematiche del singolo deamon.
+
+\subsubsection{Assenza di reale multithreading} 
+    Qiling non supporta l'emulazione di più thread in parallelo ma la simula eseguendo i singoli thread secondo scheduling round-robin. Nel contesto applicativo di questo progetto questo approccio impedisce analisi conclusive su qualsiasi tipo di vulnerabilità basata su race condition.
+
+     Essendo una limitazione strutturale di Qiling l'unica soluzione è un'esecuzione realmente concorrente dei thread guest, ciò richiederebbe lo sviluppo di un nuovo motore di emulazione, ben al di fuori dello scope di questo progetto.
+
+\end{document}

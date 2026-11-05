@@ -1,0 +1,10 @@
+__pycache__
+logs/
+quiling/
+.quilingenv/
+tenda-nettapd/
+ghidra/
+firmware/
+
+.env
+*.log
